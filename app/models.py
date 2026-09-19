@@ -58,6 +58,10 @@ class ObservationReviseIn(ObservationIn):
     revision: int = Field(ge=1, description="客户端持有的当前版本号；与服务端不一致时拒绝修订（409）")
 
 
+class ObservationImpactPreviewIn(ObservationIn):
+    impact_limit: float = Field(description="影响阈值（正数）：|偏差变化| 严格大于该值才计入影响区间")
+
+
 # ---------- 响应 ----------
 
 class ReadingOut(BaseModel):
@@ -222,3 +226,29 @@ class DriftStabilityWindowOut(BaseModel):
     duration_seconds: float = Field(description="稳定持续秒数（t_end − t_start）")
     min_bias: float = Field(description="子区间内 bias 实际达到的最小值")
     max_bias: float = Field(description="子区间内 bias 实际达到的最大值")
+
+
+class ImpactIntervalOut(BaseModel):
+    t_start: float = Field(description="影响区间起点（Unix 秒）：|偏差变化| 与 impact_limit 的解析交点")
+    t_end: float = Field(description="影响区间终点（Unix 秒）")
+    start_iso: str
+    end_iso: str
+    duration_seconds: float = Field(description="超限持续秒数（t_end − t_start）")
+
+
+class ObservationImpactPreviewOut(BaseModel):
+    timestamp: float = Field(description="候选观测时点（Unix 秒）")
+    timestamp_iso: str
+    impact_limit: float = Field(description="影响阈值（正数）：|偏差变化| 严格大于该值才计入影响区间")
+    candidate_bias: float = Field(description="按现有异常判定算出的候选观测偏差（不落库）")
+    current_bias: float = Field(description="当前分段线性曲线在候选时点的插值偏差")
+    affected_from: float = Field(description="受影响时间范围下界（Unix 秒）：候选点左侧最近观测时点")
+    affected_from_iso: str
+    affected_to: float = Field(description="受影响时间范围上界（Unix 秒）：候选点右侧最近观测时点")
+    affected_to_iso: str
+    max_abs_change: float = Field(description="受影响范围内 |新曲线 − 当前曲线| 的最大值")
+    max_change_at: float = Field(description="最大绝对偏差变化的最早发生时点（Unix 秒）")
+    max_change_at_iso: str
+    impact_intervals: list[ImpactIntervalOut] = Field(
+        description="|偏差变化| > impact_limit 的连续区间，按时间排序；阈值交点解析求解"
+    )

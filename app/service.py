@@ -54,6 +54,10 @@ class InvalidSpreadError(Exception):
     """稳定窗口允许的最大波动幅度不是正数。"""
 
 
+class InsufficientNeighborsError(Exception):
+    """候选时点两侧无法同时找到已有观测，无法形成插入预演所需的双侧邻点。"""
+
+
 # ---------- 观测 ----------
 
 def create_observation(reference: float, tolerance: float, readings: list[float], ts: float) -> dict:
@@ -729,3 +733,66 @@ def drift_stability_window(frm: float, to: float, max_spread: float) -> dict:
             "min_bias": min_bias,
             "max_bias": max_bias,
         }
+
+
+# ---------- 观测影响预演 ----------
+
+def observation_impact_preview(
+    reference: float, tolerance: float, readings: list[float], ts: float, impact_limit: float
+) -> dict:
+    """预演插入一条观测对当前分段线性偏差曲线的影响；候选观测不落库。
+
+    沿用与登记观测相同的异常判定算出候选偏差，但绝不写入观测、修订历史或区间表
+    （连接置为 query_only，任何写操作都会被 SQLite 拒绝）。仅当候选时点两侧都已
+    有观测时才能预演：插入只会把左右最近观测之间的区间重新分段，受影响范围即
+    [prev.ts, next.ts]。曲线变化量 Δ 是折点 (prev, 0) → (候选, Δc) → (next, 0)
+    的分段线性函数，|Δ| 与 impact_limit 的交点解析求解，不做固定步长采样。
+    """
+    if not impact_limit > 0:  # 同时拒绝 NaN
+        raise InvalidLimitError(f"impact_limit ({impact_limit}) must be positive")
+    bias, _group_median, _inliers, _outliers = calibration.compute_bias(reference, tolerance, readings)
+    with closing(connect()) as conn:
+        conn.execute("PRAGMA query_only = ON")  # 强制只读，预演不落库
+        if conn.execute("SELECT 1 FROM observations WHERE ts = ?", (ts,)).fetchone():
+            raise DuplicateTimestampError(f"an observation already exists at timestamp {ts}")
+        prev = conn.execute(
+            "SELECT ts, bias FROM observations WHERE ts < ? ORDER BY ts DESC LIMIT 1", (ts,)
+        ).fetchone()
+        nxt = conn.execute(
+            "SELECT ts, bias FROM observations WHERE ts > ? ORDER BY ts ASC LIMIT 1", (ts,)
+        ).fetchone()
+        if prev is None or nxt is None:
+            raise InsufficientNeighborsError(
+                f"cannot preview impact at timestamp {ts}: "
+                "existing observations are required on both sides"
+            )
+        t_prev, bias_prev = prev["ts"], prev["bias"]
+        t_next, bias_next = nxt["ts"], nxt["bias"]
+    current_bias = calibration.interpolate(ts, t_prev, bias_prev, t_next, bias_next)
+    max_abs_change, max_change_at, exceedances = calibration.insertion_impact(
+        t_prev, ts, t_next, bias - current_bias, impact_limit
+    )
+    return {
+        "timestamp": ts,
+        "timestamp_iso": epoch_to_iso(ts),
+        "impact_limit": impact_limit,
+        "candidate_bias": bias,
+        "current_bias": current_bias,
+        "affected_from": t_prev,
+        "affected_from_iso": epoch_to_iso(t_prev),
+        "affected_to": t_next,
+        "affected_to_iso": epoch_to_iso(t_next),
+        "max_abs_change": max_abs_change,
+        "max_change_at": max_change_at,
+        "max_change_at_iso": epoch_to_iso(max_change_at),
+        "impact_intervals": [
+            {
+                "t_start": s,
+                "t_end": e,
+                "start_iso": epoch_to_iso(s),
+                "end_iso": epoch_to_iso(e),
+                "duration_seconds": e - s,
+            }
+            for s, e in exceedances
+        ],
+    }

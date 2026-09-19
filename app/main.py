@@ -18,6 +18,8 @@ from .models import (
     DriftStabilityWindowOut,
     HistoricalCorrectionOut,
     IntervalOut,
+    ObservationImpactPreviewIn,
+    ObservationImpactPreviewOut,
     ObservationIn,
     ObservationOut,
     ObservationReviseIn,
@@ -26,6 +28,7 @@ from .models import (
 )
 from .service import (
     DuplicateTimestampError,
+    InsufficientNeighborsError,
     InvalidBudgetError,
     InvalidLimitError,
     InvalidSpreadError,
@@ -112,6 +115,34 @@ def get_observation_revisions(obs_id: int) -> list[dict]:
         return service.list_revisions(obs_id)
     except ObservationNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/observation-impact-preview", response_model=ObservationImpactPreviewOut)
+def post_observation_impact_preview(payload: ObservationImpactPreviewIn) -> dict:
+    """预演插入一条观测对当前分段线性偏差曲线的影响；候选观测不落库。
+
+    请求体与登记观测一致（沿用同一套异常判定计算候选偏差），额外携带正数
+    impact_limit。仅在候选时点两侧都已有观测时预演：插入只会把左右最近观测之间
+    的区间重新分段，受影响范围即两侧邻点之间；将插入后的虚拟分段线性曲线与当前
+    曲线解析比较，返回受影响时间范围、最大绝对偏差变化及其最早发生时点，并按时间
+    列出 |变化| > impact_limit 的连续区间（阈值交点精确求解，不做固定步长采样）。
+    查询只读，不改写观测、修订历史或区间表；候选时点已占用或无法形成双侧邻点时
+    返回 409。
+    """
+    try:
+        return service.observation_impact_preview(
+            reference=payload.reference,
+            tolerance=payload.tolerance,
+            readings=payload.readings,
+            ts=payload.timestamp,
+            impact_limit=payload.impact_limit,
+        )
+    except (DuplicateTimestampError, InsufficientNeighborsError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except InvalidLimitError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CalibrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/intervals", response_model=list[IntervalOut])

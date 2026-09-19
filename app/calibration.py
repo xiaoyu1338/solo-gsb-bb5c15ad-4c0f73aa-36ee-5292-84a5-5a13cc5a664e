@@ -134,6 +134,38 @@ def exceedance_subranges(t0: float, b0: float, t1: float, b1: float, limit: floa
     return out
 
 
+# ---------- 观测插入影响预演 ----------
+
+def insertion_impact(
+    t_prev: float, t_candidate: float, t_next: float, delta_candidate: float, limit: float
+) -> tuple[float, float, list[tuple[float, float]]]:
+    """解析比较插入候选观测前后的分段线性偏差曲线。
+
+    插入只会把 (t_prev, t_next) 一段重新分段，曲线变化量 Δ 是折点为
+    (t_prev, 0) → (t_candidate, delta_candidate) → (t_next, 0) 的分段线性函数，
+    该范围之外 Δ 恒为 0。返回 (max_abs_change, max_change_at, exceedances)：
+
+    - max_abs_change = |delta_candidate|：两段上 |Δ| 分别由 0 单调升至峰值再降回 0，
+      最大值必在候选点取得；
+    - max_change_at 为该最大值的最早发生时点：delta_candidate ≠ 0 时唯一（候选点
+      本身）；delta_candidate = 0 时 Δ 恒为 0，取受影响范围起点 t_prev；
+    - exceedances 为 |Δ| > limit 的连续区间 [(s, e)]（至多一段）：在两段上分别复用
+      exceedance_subranges 解析求解与 limit 的交点，跨候选点仍超限的片段合并；
+      恰等于 limit 的瞬时不计入。全程解析解，不做固定步长采样。
+    """
+    max_abs_change = abs(delta_candidate)
+    max_change_at = t_candidate if delta_candidate != 0.0 else t_prev
+    exceedances: list[list[float]] = []
+    for s, e, _direction in exceedance_subranges(t_prev, 0.0, t_candidate, delta_candidate, limit):
+        exceedances.append([s, e])
+    for s, e, _direction in exceedance_subranges(t_candidate, delta_candidate, t_next, 0.0, limit):
+        if exceedances and exceedances[-1][1] == s and max_abs_change > limit:
+            exceedances[-1][1] = e  # 候选点两侧同属一段超限：跨候选点合并
+        else:
+            exceedances.append([s, e])
+    return max_abs_change, max_change_at, [(s, e) for s, e in exceedances]
+
+
 # ---------- 最长稳定窗口（max−min ≤ spread） ----------
 
 def _clip_to_band(t0: float, b0: float, t1: float, b1: float, lo: float, hi: float) -> tuple[float, float] | None:
