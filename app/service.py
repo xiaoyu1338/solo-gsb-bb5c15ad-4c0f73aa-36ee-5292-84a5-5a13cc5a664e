@@ -54,6 +54,10 @@ class InvalidSpreadError(Exception):
     """稳定窗口允许的最大波动幅度不是正数。"""
 
 
+class NoBilateralNeighborsError(Exception):
+    """候选时点两侧没有已存在的观测，无法形成双侧邻点。"""
+
+
 # ---------- 观测 ----------
 
 def create_observation(reference: float, tolerance: float, readings: list[float], ts: float) -> dict:
@@ -729,3 +733,117 @@ def drift_stability_window(frm: float, to: float, max_spread: float) -> dict:
             "min_bias": min_bias,
             "max_bias": max_bias,
         }
+
+
+# ---------- 观测影响预演（虚拟插入，不落库） ----------
+
+def observation_impact_preview(
+    reference: float,
+    tolerance: float,
+    readings: list[float],
+    ts: float,
+    impact_limit: float,
+) -> dict:
+    """预演在 ts 插入一条候选观测后分段线性 bias 曲线的变化。
+
+    候选观测绝不入库：连接置为 query_only，既不写观测/读数，也不写区间表或
+    修订历史。仅当 ts 严格落在两个已存在观测之间时才可预演；时点已占用或
+    无法形成双侧邻点（不足两条观测、候选点落在覆盖范围两端之外）返回 409。
+
+    插入只改变左邻 (t_L, b_L) 与右邻 (t_R, b_R) 之间的一段：当前曲线在该段
+    是 (b_L)→(b_R) 的单一直线；插入后变为 (b_L)→b_c 与 b_c→(b_R) 两段。
+    两曲线之差 d(t) = 虚拟 − 当前 是以 (t_L, 0)、(t_c, δ)、(t_R, 0) 为折点
+    的分段线性函数，其中 δ = b_c − 当前曲线在 t_c 的线性插值。因此：
+
+    - 受影响时间范围恰为 [t_L, t_R]，范围外两曲线完全相同；
+    - 最大绝对偏差变化为 |δ|，δ ≠ 0 时最早（也是唯一）发生在 t_c，
+      δ = 0 时两曲线处处相同，最早时点取范围起点 t_L；
+    - |d| > impact_limit 的区间在左右两半段上分别解析求解（d 在每个半段上
+      线性，阈值交点 t* = t0 + (±limit − d0)·Δt/(d1 − d0) 精确给出），
+      跨候选点仍连续同向时合并，不做固定步长采样。
+    """
+    # 入参本身可能无法算出偏差（读数不足/全部异常），在开连接前先校验
+    bias, group_median, _inliers, outliers = calibration.compute_bias(reference, tolerance, readings)
+    with closing(connect()) as conn:
+        conn.execute("PRAGMA query_only = ON")  # 强制只读，任何写操作都会被 SQLite 拒绝
+        if conn.execute("SELECT 1 FROM observations WHERE ts = ?", (ts,)).fetchone():
+            raise DuplicateTimestampError(f"an observation already exists at timestamp {ts}")
+        left = conn.execute(
+            "SELECT id, ts, bias FROM observations WHERE ts < ? ORDER BY ts DESC LIMIT 1", (ts,)
+        ).fetchone()
+        right = conn.execute(
+            "SELECT id, ts, bias FROM observations WHERE ts > ? ORDER BY ts ASC LIMIT 1", (ts,)
+        ).fetchone()
+    if left is None or right is None:
+        raise NoBilateralNeighborsError(
+            f"candidate timestamp {ts} must lie strictly between two existing observations "
+            f"so that both neighbors are present"
+        )
+
+    t_l, b_l = left["ts"], left["bias"]
+    t_r, b_r = right["ts"], right["bias"]
+    current_at_candidate = calibration.interpolate(ts, t_l, b_l, t_r, b_r)
+    delta = bias - current_at_candidate
+
+    # 差值曲线 d 的三个折点；在左右两个半段上分别解析求 |d| > impact_limit
+    vertices = [(t_l, 0.0), (ts, delta), (t_r, 0.0)]
+    merged: list[dict] = []
+    for (t0, d0), (t1, d1) in zip(vertices, vertices[1:]):
+        for s, e, sign in calibration.exceedance_subranges(t0, d0, t1, d1, impact_limit):
+            ds = calibration.interpolate(s, t0, d0, t1, d1)
+            de = calibration.interpolate(e, t0, d0, t1, d1)
+            peak = max(abs(ds), abs(de))  # 子区间内 |d| 仍是线性，峰值必在端点
+            direction = "increase" if sign == "high" else "decrease"
+            _merge_or_append(merged, s, e, direction, peak,
+                             junction_bias=d0 if s == t0 else None, limit=impact_limit)
+    impact_intervals = [
+        {
+            "t_start": m["t_start"],
+            "t_end": m["t_end"],
+            "start_iso": epoch_to_iso(m["t_start"]),
+            "end_iso": epoch_to_iso(m["t_end"]),
+            "direction": m["direction"],
+            "duration_seconds": m["t_end"] - m["t_start"],
+            "peak_abs_change": m["peak_abs_deviation"],
+        }
+        for m in merged
+    ]
+
+    # |d| 为“顶点在 (t_c, |δ|) 的三角”：δ≠0 最大值唯一落在候选时点；
+    # δ=0 时处处为零，最早时点取受影响范围起点。
+    if delta > 0.0:
+        change_direction = "increase"
+    elif delta < 0.0:
+        change_direction = "decrease"
+    else:
+        change_direction = "unchanged"
+    max_abs_change = abs(delta)
+    max_at = ts if delta != 0.0 else t_l
+
+    return {
+        "timestamp": ts,
+        "timestamp_iso": epoch_to_iso(ts),
+        "reference": reference,
+        "tolerance": tolerance,
+        "group_median": group_median,
+        "candidate_bias": bias,
+        "outliers": outliers,
+        "impact_limit": impact_limit,
+        "affected_range": {
+            "t_start": t_l,
+            "t_end": t_r,
+            "start_iso": epoch_to_iso(t_l),
+            "end_iso": epoch_to_iso(t_r),
+            "duration_seconds": t_r - t_l,
+            "left_observation_id": left["id"],
+            "right_observation_id": right["id"],
+            "current_bias_start": b_l,
+            "current_bias_end": b_r,
+            "candidate_bias": bias,
+        },
+        "max_abs_change": max_abs_change,
+        "max_abs_change_at": max_at,
+        "max_abs_change_at_iso": epoch_to_iso(max_at),
+        "change_direction": change_direction,
+        "impact_intervals": impact_intervals,
+    }

@@ -18,6 +18,8 @@ from .models import (
     DriftStabilityWindowOut,
     HistoricalCorrectionOut,
     IntervalOut,
+    ObservationImpactPreviewIn,
+    ObservationImpactPreviewOut,
     ObservationIn,
     ObservationOut,
     ObservationReviseIn,
@@ -30,6 +32,7 @@ from .service import (
     InvalidLimitError,
     InvalidSpreadError,
     InvalidWindowError,
+    NoBilateralNeighborsError,
     ObservationNotFoundError,
     OutOfCoverageError,
     RevisionConflictError,
@@ -220,3 +223,28 @@ def get_drift_stability_window(
         return service.drift_stability_window(frm=from_, to=to, max_spread=max_spread)
     except (InvalidWindowError, InvalidSpreadError, OutOfCoverageError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/observation-impact-preview", response_model=ObservationImpactPreviewOut)
+def post_observation_impact_preview(payload: ObservationImpactPreviewIn) -> dict:
+    """预演插入一条不落库观测对当前分段线性偏差曲线的影响。
+
+    沿用现有异常判定计算候选偏差；仅在候选时点严格位于两个已存在观测之间时
+    预演（时点已占用或缺任一侧邻点返回 409）。将插入后的虚拟分段线性曲线与
+    当前曲线解析比较：返回受影响时间范围（左右邻点构成的区间）、最大绝对偏差
+    变化及其最早发生时点，并按时间列出 |变化| > impact_limit 的连续区间，
+    阈值交点逐线性半段解析求解，不做固定步长采样。请求只读，不改写观测、
+    修订历史或区间表。
+    """
+    try:
+        return service.observation_impact_preview(
+            reference=payload.reference,
+            tolerance=payload.tolerance,
+            readings=payload.readings,
+            ts=payload.timestamp,
+            impact_limit=payload.impact_limit,
+        )
+    except (DuplicateTimestampError, NoBilateralNeighborsError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except CalibrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc

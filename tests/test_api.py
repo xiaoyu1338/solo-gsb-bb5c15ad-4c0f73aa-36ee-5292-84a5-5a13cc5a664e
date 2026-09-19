@@ -994,3 +994,221 @@ def test_drift_stability_window_out_of_coverage_rejected(exceedance_points):
 def test_drift_stability_window_without_any_observation_rejected(client):
     resp = client.get("/drift-stability-window", params={"from": 1.0, "to": 2.0, "max_spread": 2.0})
     assert resp.status_code == 400
+
+
+# ---------- 观测影响预演（不落库） ----------
+
+def preview_observation(client, ts, reference, tolerance, readings, impact_limit):
+    return client.post(
+        "/observation-impact-preview",
+        json={"timestamp": ts, "reference": reference, "tolerance": tolerance,
+              "readings": readings, "impact_limit": impact_limit},
+    )
+
+
+def test_observation_impact_preview_basic_increase(two_points):
+    # 当前曲线 1000(bias1) → 2000(bias3)，候选点 1500 偏差 2.5：δ = 2.5 − 2.0 = 0.5
+    resp = preview_observation(two_points, 1500.0, 10.0, 0.5, [7.5, 7.6, 7.4], impact_limit=0.2)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["candidate_bias"] == pytest.approx(2.5)
+    assert body["group_median"] == pytest.approx(7.5)
+    assert body["outliers"] == []
+
+    rng = body["affected_range"]
+    assert (rng["t_start"], rng["t_end"]) == (1000.0, 2000.0)
+    assert rng["duration_seconds"] == pytest.approx(1000.0)
+    assert rng["left_observation_id"] == 1
+    assert rng["right_observation_id"] == 2
+    assert rng["current_bias_start"] == pytest.approx(1.0)
+    assert rng["current_bias_end"] == pytest.approx(3.0)
+    assert rng["candidate_bias"] == pytest.approx(2.5)
+
+    assert body["max_abs_change"] == pytest.approx(0.5)
+    assert body["max_abs_change_at"] == pytest.approx(1500.0)
+    assert body["max_abs_change_at_iso"].startswith("1970-01-01T00:25:00")
+    assert body["change_direction"] == "increase"
+
+    # |d| = 0.2 的解析交点：左半段 t=1200，右半段 t=1800，跨候选点合并为一段
+    intervals = body["impact_intervals"]
+    assert [(i["t_start"], i["t_end"], i["direction"]) for i in intervals] == [
+        (1200.0, 1800.0, "increase"),
+    ]
+    assert intervals[0]["duration_seconds"] == pytest.approx(600.0)
+    assert intervals[0]["peak_abs_change"] == pytest.approx(0.5)
+    assert intervals[0]["start_iso"].startswith("1970-01-01T00:20:00")
+    assert intervals[0]["end_iso"].startswith("1970-01-01T00:30:00")
+
+
+def test_observation_impact_preview_decrease_direction(two_points):
+    # 候选点 1500 偏差 0.5：δ = 0.5 − 2.0 = −1.5（降低）
+    resp = preview_observation(two_points, 1500.0, 10.0, 0.5, [9.5, 9.6, 9.4], impact_limit=0.4)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["change_direction"] == "decrease"
+    assert body["max_abs_change"] == pytest.approx(1.5)
+    assert body["max_abs_change_at"] == pytest.approx(1500.0)
+    # |d| = 0.4：−0.003·(t−1000) = −0.4 → t = 1133⅓；右侧对称 t = 1866⅔
+    intervals = body["impact_intervals"]
+    assert [(i["t_start"], i["t_end"], i["direction"]) for i in intervals] == [
+        (pytest.approx(1133.3333333333333), pytest.approx(1866.6666666666667), "decrease"),
+    ]
+    assert intervals[0]["duration_seconds"] == pytest.approx(733.3333333333334)
+    assert intervals[0]["peak_abs_change"] == pytest.approx(1.5)
+
+
+def test_observation_impact_preview_no_change_lies_on_current_curve(two_points):
+    # 候选偏差 2.0 恰为当前曲线在 1500 的插值：δ = 0，两曲线处处相同
+    resp = preview_observation(two_points, 1500.0, 10.0, 0.5, [8.0, 8.1, 7.9], impact_limit=0.1)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["candidate_bias"] == pytest.approx(2.0)
+    assert body["max_abs_change"] == pytest.approx(0.0)
+    # 最大值 0 处处成立，最早时点取受影响范围起点
+    assert body["max_abs_change_at"] == pytest.approx(1000.0)
+    assert body["change_direction"] == "unchanged"
+    assert body["impact_intervals"] == []
+
+
+def test_observation_impact_preview_threshold_touch_not_counted(two_points):
+    # δ = 0.5，impact_limit 恰等于 |δ|：仅候选点瞬时相等，不计入，区间为空
+    resp = preview_observation(two_points, 1500.0, 10.0, 0.5, [7.5, 7.6, 7.4], impact_limit=0.5)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["max_abs_change"] == pytest.approx(0.5)
+    assert body["impact_intervals"] == []
+
+
+def test_observation_impact_preview_change_below_limit_everywhere(two_points):
+    # δ = 0.5，limit 1.0：全程 |d| ≤ 0.5 < 1.0
+    resp = preview_observation(two_points, 1500.0, 10.0, 0.5, [7.5, 7.6, 7.4], impact_limit=1.0)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["impact_intervals"] == []
+
+
+def test_observation_impact_preview_non_equidistant_neighbors(client):
+    # 左邻 1000(bias1)，右邻 3000(bias5)；候选点 1500 偏差 4.0
+    make_observation(client, 1000.0, 10.0, 0.5, [9.0, 9.1, 8.9, 20.0])
+    make_observation(client, 3000.0, 10.0, 0.5, [5.0, 5.1, 4.9])
+    resp = preview_observation(client, 1500.0, 10.0, 0.5, [6.0, 6.1, 5.9], impact_limit=0.5)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # 当前曲线在 1500 的插值：1 + (5−1)·500/2000 = 2.0；δ = 4 − 2 = 2
+    assert body["max_abs_change"] == pytest.approx(2.0)
+    assert body["max_abs_change_at"] == pytest.approx(1500.0)
+    rng = body["affected_range"]
+    assert (rng["t_start"], rng["t_end"]) == (1000.0, 3000.0)
+    assert rng["left_observation_id"] == 1
+    assert rng["right_observation_id"] == 2
+    # 左半段 d 斜率 2/500：|d| = 0.5 → t = 1000 + 0.5·500/2 = 1125
+    # 右半段 d 斜率 −2/1500：|d| = 0.5 → t = 3000 − 0.5·1500/2 = 2625
+    intervals = body["impact_intervals"]
+    assert [(i["t_start"], i["t_end"], i["direction"]) for i in intervals] == [
+        (1125.0, 2625.0, "increase"),
+    ]
+    assert intervals[0]["peak_abs_change"] == pytest.approx(2.0)
+
+
+def test_observation_impact_preview_uses_nearest_neighbors_with_chain(client):
+    # 四点链 1000/2000/3000/4000，候选点 2500 应由最近邻 2000、3000 夹住
+    make_observation(client, 1000.0, 10.0, 0.5, [9.0, 9.1, 8.9])   # bias 1
+    make_observation(client, 2000.0, 10.0, 0.5, [7.0, 7.1, 6.9])   # bias 3
+    make_observation(client, 3000.0, 10.0, 0.5, [9.0, 9.1, 8.9])   # bias 1
+    make_observation(client, 4000.0, 10.0, 0.5, [7.0, 7.1, 6.9])   # bias 3
+    resp = preview_observation(client, 2500.0, 10.0, 0.5, [6.0, 6.1, 5.9], impact_limit=0.1)
+    assert resp.status_code == 200, resp.text
+    rng = resp.json()["affected_range"]
+    assert (rng["t_start"], rng["t_end"]) == (2000.0, 3000.0)
+    assert rng["current_bias_start"] == pytest.approx(3.0)
+    assert rng["current_bias_end"] == pytest.approx(1.0)
+    # 当前插值 bias(2500) = 2.0，候选 bias = 4.0 → δ = 2
+    assert resp.json()["max_abs_change"] == pytest.approx(2.0)
+
+
+def test_observation_impact_preview_marks_outliers(client):
+    # 20.0 偏离组中位数超差，标记异常但不影响偏差计算
+    make_observation(client, 1000.0, 10.0, 0.5, [9.0, 9.1, 8.9])
+    make_observation(client, 2000.0, 10.0, 0.5, [7.0, 7.1, 6.9])
+    resp = preview_observation(
+        client, 1500.0, 10.0, 0.5, [8.0, 8.1, 7.9, 20.0], impact_limit=0.1
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["outliers"] == [20.0]
+    assert body["candidate_bias"] == pytest.approx(2.0)   # 有效读数中位数 8.0
+
+
+def test_observation_impact_preview_accepts_iso8601_timestamp(two_points):
+    resp = preview_observation(
+        two_points, "1970-01-01T00:25:00Z", 10.0, 0.5, [7.5, 7.6, 7.4], impact_limit=0.2
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["timestamp"] == pytest.approx(1500.0)
+    assert (body["impact_intervals"][0]["t_start"], body["impact_intervals"][0]["t_end"]) == (
+        pytest.approx(1200.0), pytest.approx(1800.0),
+    )
+
+
+def test_observation_impact_preview_occupied_timestamp_conflicts(two_points):
+    resp = preview_observation(two_points, 1000.0, 10.0, 0.5, [9.0, 9.1, 8.9], impact_limit=0.1)
+    assert resp.status_code == 409
+    assert "already exists" in resp.json()["detail"]
+
+
+def test_observation_impact_preview_without_bilateral_neighbors_conflicts(client):
+    # 无任何观测
+    resp = preview_observation(client, 1000.0, 10.0, 0.5, [9.0, 9.1, 8.9], impact_limit=0.1)
+    assert resp.status_code == 409
+    assert "both neighbors" in resp.json()["detail"]
+
+    # 仅一条观测：左右邻点无法同时形成
+    make_observation(client, 1000.0, 10.0, 0.5, [9.0, 9.1, 8.9])
+    resp = preview_observation(client, 1500.0, 10.0, 0.5, [9.0, 9.1, 8.9], impact_limit=0.1)
+    assert resp.status_code == 409
+    assert "both neighbors" in resp.json()["detail"]
+
+
+def test_observation_impact_preview_outside_span_conflicts(two_points):
+    for ts in (500.0, 1000.0, 2000.0, 2500.0):
+        resp = preview_observation(two_points, ts, 10.0, 0.5, [9.0, 9.1, 8.9], impact_limit=0.1)
+        assert resp.status_code == 409, ts
+
+
+def test_observation_impact_preview_non_positive_limit_rejected(two_points):
+    for limit in (0.0, -1.0):
+        resp = preview_observation(two_points, 1500.0, 10.0, 0.5, [8.0, 8.1, 7.9], impact_limit=limit)
+        assert resp.status_code == 422
+
+
+def test_observation_impact_preview_invalid_readings_rejected(two_points):
+    # 读数不足
+    resp = preview_observation(two_points, 1500.0, 10.0, 0.5, [8.0, 8.1], impact_limit=0.1)
+    assert resp.status_code == 422
+    # 全部判为异常：无法计算偏差
+    resp = preview_observation(two_points, 1500.0, 10.0, 0.0, [1.0, 2.0, 3.0, 4.0], impact_limit=0.1)
+    assert resp.status_code == 422
+    assert "cannot compute a calibration bias" in resp.json()["detail"]
+
+
+def test_observation_impact_preview_is_read_only(two_points):
+    before = (
+        two_points.get("/observations").json(),
+        two_points.get("/intervals").json(),
+    )
+    # 成功预演（含异常读数）与冲突预演都不得改动任何现状数据
+    preview_observation(two_points, 1500.0, 10.0, 0.5, [7.5, 7.6, 7.4, 20.0], impact_limit=0.2)
+    preview_observation(two_points, 1000.0, 10.0, 0.5, [9.0, 9.1, 8.9], impact_limit=0.2)
+    preview_observation(two_points, 2500.0, 10.0, 0.5, [9.0, 9.1, 8.9], impact_limit=0.2)
+    after = (
+        two_points.get("/observations").json(),
+        two_points.get("/intervals").json(),
+    )
+    assert after == before
+    # 候选时点仍未被占用：真正登记应成功（201）
+    resp = two_points.post(
+        "/observations",
+        json={"timestamp": 1500.0, "reference": 10.0, "tolerance": 0.5,
+              "readings": [7.5, 7.6, 7.4]},
+    )
+    assert resp.status_code == 201, resp.text

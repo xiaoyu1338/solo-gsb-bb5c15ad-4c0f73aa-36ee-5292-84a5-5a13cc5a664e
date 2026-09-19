@@ -28,6 +28,7 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 10. **漂移预算耗尽分析**：`GET /drift-budget-depletion?from=&budget=` 从 `from` 起沿当前分段线性 `bias` 累积 `|bias|·秒`，**解析求出**预算首次耗尽的精确时点：段内 `bias` 过零时先在解析零点拆分（`|bias|` 仅在拆分后的子段上才是线性函数），目标面积落入某子段时反解其累积二次式，不做固定步长采样。返回 `depleted_at`（覆盖范围内未耗尽为 `null`）、截至耗尽点（未耗尽时为覆盖终点）的 `consumed`/`remaining`，以及按插值区间裁剪的分段 `contributions`。`budget` 必须为正数，`from` 越出覆盖范围返回 400。
 11. **漂移稳定窗口分析**：`GET /drift-stability-window?from=&to=&max_spread=` 在覆盖范围内**解析求出** `max(bias) − min(bias) ≤ max_spread` 的持续时间最长的连续子区间：最优窗口必是某临界带宽 `[m, m+max_spread]` 的连通分量（`m` 取遍折点取值及其下移 `max_spread` 的值），分量边界由线性段与带宽边缘的解析交点精确定位，可落在插值段内部，不做固定步长采样；时长并列时返回起点最早者。响应含起止时刻、`duration_seconds` 与窗口内实际达到的 `min_bias`/`max_bias`。`from` 必须小于 `to`、`max_spread` 必须为正数，任一边界越界返回 400。
 12. **历史时点漂移补偿**：`GET /historical-correction?effective_at=&as_of=&reading=` 按 `as_of` 系统时点重建校准状态后，对目标观测时点 `effective_at` 的读数做漂移补偿。重建依据 `observations.created_at`、当前版本与 `revisions` 快照：`created_at > as_of` 的观测尚未创建、不参与；修订自 `changed_at` 起生效（恰等于 `changed_at` 时使用新版本），`changed_at > as_of` 的修订一律回滚到快照旧值。随后按重建出的观测时点排序，沿用与 `/corrections` 相同的覆盖范围与线性插值规则。查询**只读**，不改写当前观测、修订历史或区间表；响应附带 `as_of` 及所用端点的观测 ID 与版本。
+13. **观测影响预演**：`POST /observation-impact-preview` 接收一条**待插入但不落库**的观测（字段与登记观测一致）与正数 `impact_limit`，沿用现有异常判定计算候选偏差，仅在候选时点**严格位于两个已存在观测之间**时预演；候选时点已占用或无法形成双侧邻点返回 409。插入只改变左右邻点构成的区间：服务将插入后的虚拟分段线性曲线与当前曲线**解析比较**（差值曲线是以左邻点 0、候选点 δ、右邻点 0 为折点的分段线性函数），返回受影响时间范围、最大绝对偏差变化及其最早发生时点，并按时间列出 `|变化| > impact_limit` 的连续区间，阈值交点逐线性半段**精确求解**，不做固定步长采样。请求**只读**，不改写观测、修订历史或区间表。
 
 ## API 一览
 
@@ -44,6 +45,7 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 | GET | `/drift-exceedances` | 解析求解偏差越出 ±limit 的连续区间（方向/持续秒数/峰值） |
 | GET | `/drift-budget-depletion` | 解析求解漂移预算（\|bias\|·秒）首次耗尽的精确时点 |
 | GET | `/drift-stability-window` | 解析求解 max(bias) − min(bias) ≤ max_spread 的最长连续稳定子区间 |
+| POST | `/observation-impact-preview` | 预演插入一条不落库观测对偏差曲线的影响（受影响范围/最大变化/超阈值区间；只读） |
 | GET | `/health` | 健康检查 |
 
 时间戳支持 Unix 秒（数字）或 ISO 8601 字符串（如 `2026-09-18T08:00:00Z`），缺省为服务器当前时间。
@@ -316,13 +318,53 @@ curl "http://localhost:8000/drift-stability-window?from=2026-09-18T08:00:00Z&to=
 
 `min_bias`/`max_bias` 为窗口内实际达到的极值（可能小于 `max_spread` 所允许的带宽）；`from ≥ to`、`max_spread ≤ 0` 或窗口边界越出覆盖范围均返回 400。
 
+### 观测影响预演（不落库）
+
+`POST /observation-impact-preview` 回答“若在某时点插入这条观测，偏差曲线会如何变化”。请求体与登记观测一致（`timestamp`、`reference`、`tolerance`、`readings`），额外携带正数 `impact_limit`。服务沿用现有异常判定计算候选偏差（不入库），仅在候选时点严格位于两个已存在观测之间时预演：插入只会把左邻 `(t_L, b_L)` 与右邻 `(t_R, b_R)` 之间的单一直线替换为 `b_L → b_c → b_R` 两段，因此两曲线之差 `d(t) = 虚拟偏差 − 当前偏差` 是以 `(t_L, 0)`、`(t_c, δ)`、`(t_R, 0)` 为折点的分段线性函数（`δ = b_c − 当前曲线在候选时点的插值`）。受影响范围恰为 `[t_L, t_R]`，最大绝对变化为 `|δ|`（发生在候选时点）；`|d| > impact_limit` 的区间在左右半段上分别按线性方程**解析求交点**，跨候选点仍连续同向时合并，全程无固定步长采样。
+
+沿用 08:00 `bias 1.0` → 10:00 `bias 3.0` 的区间，预演在 09:00 插入一条 `bias 2.5` 的观测（当前插值为 2.0，`δ = 0.5`），关注变化超过 `0.2` 的时段：
+
+```bash
+curl -X POST http://localhost:8000/observation-impact-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"timestamp": "2026-09-18T09:00:00Z", "reference": 100.0,
+       "tolerance": 0.5, "readings": [97.5, 97.6, 97.4], "impact_limit": 0.2}'
+```
+
+响应（左右半段 `|d| = 0.2` 的解析交点为 08:40 与 09:20，合并为一段；`d` 在该段内恒正，方向 `increase`）：
+
+```json
+{
+  "timestamp": 1789722000.0, "timestamp_iso": "2026-09-18T09:00:00+00:00",
+  "reference": 100.0, "tolerance": 0.5, "group_median": 97.5,
+  "candidate_bias": 2.5, "outliers": [], "impact_limit": 0.2,
+  "affected_range": {
+    "t_start": 1789718400.0, "t_end": 1789725600.0,
+    "start_iso": "2026-09-18T08:00:00+00:00", "end_iso": "2026-09-18T10:00:00+00:00",
+    "duration_seconds": 7200.0,
+    "left_observation_id": 1, "right_observation_id": 2,
+    "current_bias_start": 1.0, "current_bias_end": 3.0, "candidate_bias": 2.5
+  },
+  "max_abs_change": 0.5,
+  "max_abs_change_at": 1789722000.0, "max_abs_change_at_iso": "2026-09-18T09:00:00+00:00",
+  "change_direction": "increase",
+  "impact_intervals": [
+    {"t_start": 1789720800.0, "t_end": 1789723200.0,
+     "start_iso": "2026-09-18T08:40:00+00:00", "end_iso": "2026-09-18T09:20:00+00:00",
+     "direction": "increase", "duration_seconds": 2400.0, "peak_abs_change": 0.5}
+  ]
+}
+```
+
+候选偏差恰落在当前曲线上（`δ = 0`）时 `max_abs_change` 为 `0`、`change_direction` 为 `unchanged`、`impact_intervals` 为空；`|δ| ≤ impact_limit` 时 `impact_intervals` 同样为空（恰等于阈值的瞬时不计入）。候选时点已存在观测，或候选时点无法同时取得左右邻点（不足两条观测、落在覆盖范围两端之外）时返回 409；读数不足 3 次、全部读数被判异常或 `impact_limit ≤ 0` 返回 422。预演不改变任何数据，之后以同一时点真正登记观测仍会成功。
+
 ### 错误码
 
 | 状态码 | 场景 |
 | --- | --- |
 | 400 | 查询时点超出校准覆盖范围（响应含可用区间；历史补偿按重建后的覆盖范围判定）；积分/超限/稳定窗口 `from ≥ to` 或任一边界越界；超限阈值 `limit ≤ 0`；稳定窗口 `max_spread ≤ 0`；预算耗尽起点 `from` 越界或 `budget ≤ 0` |
 | 404 | 修订/查询修订历史时观测 ID 不存在 |
-| 409 | 同一时点重复登记观测；修订时版本过期或目标时点已被占用 |
+| 409 | 同一时点重复登记观测；修订时版本过期或目标时点已被占用；观测影响预演的候选时点已占用或无法形成双侧邻点 |
 | 422 | 读数不足 3 次、全部读数被判异常、参数非法 |
 
 ## 本地开发
@@ -340,7 +382,7 @@ uvicorn app.main:app --reload       # 本地启动（默认 ./calibration.db）
 ```
 app/
   main.py         # FastAPI 路由
-  service.py      # 观测入库、相邻区间重算、补偿查询、as_of 历史状态重建、漂移积分、超限窗口分析、预算耗尽分析、稳定窗口分析
+  service.py      # 观测入库、相邻区间重算、补偿查询、as_of 历史状态重建、漂移积分、超限窗口分析、预算耗尽分析、稳定窗口分析、观测影响预演
   calibration.py  # 纯计算：异常判定、偏差、线性插值、分段积分、超限交点求解、预算累积反解、稳定窗口求解
   models.py       # Pydantic 请求/响应模型
   db.py           # SQLite 连接与建表

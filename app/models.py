@@ -58,6 +58,13 @@ class ObservationReviseIn(ObservationIn):
     revision: int = Field(ge=1, description="客户端持有的当前版本号；与服务端不一致时拒绝修订（409）")
 
 
+class ObservationImpactPreviewIn(ObservationIn):
+    impact_limit: float = Field(
+        gt=0,
+        description="影响阈值（正数）：仅报告插入后偏差变化绝对值严格大于该值的连续区间",
+    )
+
+
 # ---------- 响应 ----------
 
 class ReadingOut(BaseModel):
@@ -222,3 +229,55 @@ class DriftStabilityWindowOut(BaseModel):
     duration_seconds: float = Field(description="稳定持续秒数（t_end − t_start）")
     min_bias: float = Field(description="子区间内 bias 实际达到的最小值")
     max_bias: float = Field(description="子区间内 bias 实际达到的最大值")
+
+
+# ---------- 观测影响预演（不落库） ----------
+
+class ImpactAffectedRangeOut(BaseModel):
+    t_start: float = Field(description="受影响时间范围起点（Unix 秒）：插入后曲线唯一变化的区间左端观测点")
+    t_end: float = Field(description="受影响时间范围终点（Unix 秒）：右端观测点")
+    start_iso: str
+    end_iso: str
+    duration_seconds: float = Field(description="受影响持续秒数（t_end − t_start）")
+    left_observation_id: int = Field(description="左侧相邻观测 ID")
+    right_observation_id: int = Field(description="右侧相邻观测 ID")
+    current_bias_start: float = Field(description="当前曲线在范围起点处的偏差（也是插入后曲线在该点的偏差）")
+    current_bias_end: float = Field(description="当前曲线在范围终点处的偏差")
+    candidate_bias: float = Field(
+        description="候选观测按现有异常判定算出的偏差（即插入后曲线在候选时点的取值）"
+    )
+
+
+class ImpactIntervalOut(BaseModel):
+    t_start: float = Field(description="|变化| 严格大于 impact_limit 的区间起点（Unix 秒）：解析交点")
+    t_end: float = Field(description="区间终点（Unix 秒）：解析交点")
+    start_iso: str
+    end_iso: str
+    direction: str = Field(
+        description="变化方向：increase = 插入后偏差高于当前曲线；decrease = 低于当前曲线"
+    )
+    duration_seconds: float = Field(description="持续秒数（t_end − t_start）")
+    peak_abs_change: float = Field(description="区间内 |虚拟偏差 − 当前偏差| 的峰值")
+
+
+class ObservationImpactPreviewOut(BaseModel):
+    timestamp: float = Field(description="候选观测时点（Unix 秒）")
+    timestamp_iso: str
+    reference: float
+    tolerance: float
+    group_median: float = Field(description="候选读数按现有规则算出的组中位数")
+    candidate_bias: float = Field(description="沿用现有异常判定算出的候选偏差（不入库）")
+    outliers: list[float] = Field(description="候选读数中被判为异常的值（不入库）")
+    impact_limit: float = Field(description="影响阈值（正数）")
+    affected_range: ImpactAffectedRangeOut = Field(
+        description="受影响时间范围：仅候选点两侧邻点构成的区间，区间外两曲线完全一致"
+    )
+    max_abs_change: float = Field(description="受影响范围内 |虚拟偏差 − 当前偏差| 的最大值")
+    max_abs_change_at: float = Field(description="最大绝对偏差变化的最早发生时点（Unix 秒）")
+    max_abs_change_at_iso: str
+    change_direction: str = Field(
+        description="整体变化方向：increase/decrease/unchanged（δ = 候选偏差 − 当前曲线在候选时点的插值）"
+    )
+    impact_intervals: list[ImpactIntervalOut] = Field(
+        description="|变化| > impact_limit 的连续区间，按时间排序；跨候选点仍连续且同向的片段已合并"
+    )
